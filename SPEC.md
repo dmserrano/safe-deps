@@ -49,7 +49,7 @@ A GitHub Action plus a small audit service that a client org installs to:
 |---|---|---|---|
 | Detect known vulns in lockfiles | `osv-scanner`, `dependency-review-action` | all | **uses** `osv-scanner` |
 | PR check + scheduled re-scan | `osv-scanner` reusable workflows | all | **uses** |
-| Per-repo exceptions with reason + expiry | `osv-scanner.toml` `IgnoredVulns` | all | **uses** (generated) |
+| Per-repo exceptions with reason + expiry | `osv-scanner.toml` `IgnoredVulns` | all | **builds** (~20 lines): its alias matching lets a GHSA-alias exception hide a `MAL-` finding — see Resolved questions #3 |
 | Fix-version PRs | Dependabot | all | agent adds explanation + exception draft |
 | Min release age | Renovate / pnpm (delays upgrades, not enforced at merge) | Socket | **builds**: enforced at merge |
 | **One org policy across repos** | — | Snyk, Sonatype, Socket | **builds** |
@@ -99,7 +99,13 @@ release_age:
 
 agent_authored:
   detect:
-    authors: []               # bot logins that count as agents (configured per org)
+    authors:                  # PR author logins that count as agents (per org; see Resolved questions)
+      - Copilot
+      - claude[bot]
+      - devin-ai-integration[bot]
+      - cursor[bot]
+      - google-labs-jules[bot]
+      - chatgpt-codex-connector[bot]
     labels: [agent-authored]
   release_age:
     min_days: 7
@@ -128,7 +134,16 @@ repos:                        # overrides may only tighten
 | 3 | Version published < `release_age.min_days` ago (agent PR: `agent_authored.release_age`) | block | yes, by package@version exception |
 | 4 | Severity ≥ threshold (after repo tightening) | block | yes, by advisory ID |
 | 5 | Severity unknown | per `unknown_severity` | yes, by advisory ID |
-| 6 | Agent PR adds a new dependency (not a bump) | block until approved review from the named team | no exception; the review *is* the approval |
+| 6 | Agent PR adds a new dependency (not a bump) | block until approved review from the named team **on the current head commit** | no exception; the review *is* the approval |
+
+**Rule 3 and urgent fixes:** there is no automatic waiver. If the only fixed version for a
+critical advisory is younger than `min_days`, the bump needs a package@version exception
+from the security team. Deliberate: every bypass of the cooldown has a named approver.
+Documented as a known cost in the README.
+
+**Rule 6 definitions:** "new dependency" = a package name added to `package.json`
+(`dependencies` / `devDependencies`), not a transitive lockfile change. An approval counts
+only if its `commit_id` equals the PR's current head SHA — a push after approval re-blocks.
 
 **Override rule:** a repo override that loosens any value is rejected at load time with an error.
 
@@ -151,16 +166,16 @@ Demo org (separate): `security-policy` repo + three scenario repos.
 
 1. Get a GitHub App installation token (`actions/create-github-app-token`); read `policy.yaml` + `exceptions.yaml` from the policy repo.
 2. Validate policy; reject loosening overrides.
-3. Expand each exception ID to its aliases via `GET https://api.osv.dev/v1/vulns/{id}`. Refuse any exception whose ID or alias is `MAL-`.
-4. Generate `osv-scanner.toml` with `IgnoredVulns` (`id`, `ignoreUntil`, `reason`) for this repo.
-5. Run `osv-scanner --format json` on the lockfile. Non-zero from a scan *error* → rule 1.
-6. Post-check: assert no `MAL-` finding was suppressed.
+3. Run `osv-scanner --format json` on the lockfile **with no ignore config**. A scan *error* → rule 1. Findings arrive grouped by alias (`groups[].aliases`).
+4. Apply exceptions in safe-deps code, mirroring `osv-scanner`'s own matching: an unexpired exception (scoped to this repo, or org-wide) whose `id` equals any alias in a group waives that group.
+5. **Any group containing a `MAL-` ID is never waived**, whichever alias the exception names. A matching exception is reported as refused (job summary + audit `outcome` note), not silently skipped.
+6. Keep the raw findings: every group is audited as the scanner reported it, before exceptions, with `exception_id` set when one applied.
 7. Release age: for each added/changed package@version, read publish time from `https://registry.npmjs.org/<pkg>` (`time` field).
-8. Agent detection: PR author in `detect.authors` or label present. If agent-authored and the diff adds a new top-level dependency, require an approving review from a member of the named team.
+8. Agent detection: PR author in `detect.authors` or label present. If agent-authored and `package.json` gains a new package name, require an approving review from a member of the named team, submitted on the current head SHA (older approvals ignored).
 9. Decide. Write the job summary (always). POST events to the audit service with an OIDC token (never blocks the decision).
 10. Exit non-zero on block.
 
-**Triggers:** `pull_request` (required check), `schedule` nightly on default branch (opens/updates one issue per finding instead of failing a PR), `pull_request_review` (re-evaluate rule 6).
+**Triggers:** `pull_request` (required check), `schedule` nightly on default branch (one issue per repo + advisory, keyed so repeat findings update it and a clean scan closes it; the run itself does not fail), `pull_request_review` (re-evaluate rule 6).
 
 **Distribution:** tagged releases; install docs pin by commit SHA.
 
@@ -230,15 +245,16 @@ row exists.
 
 | # | Scenario | Expected |
 |---|---|---|
-| 1 | Human PR adds a package version with a known critical advisory that has a fixed version | Check fails (rule 4). Agent comments + opens bump PR. Bump PR passes. |
+| 1 | Human PR adds a package version with a known critical advisory that has a fixed version | Check fails (rule 4). Agent comments + opens bump PR. Bump PR passes. *(Fixture: choose an advisory whose fixed version is older than `min_days`, so rule 3 doesn't apply.)* |
 | 2 | PR's **lockfile** references a version with a `MAL-` advisory *(lockfile only — never `npm install` in this repo)* | Check fails (rule 2). Exception PR for that ID is rejected by the action. Agent comments "remove" only. |
 | 3 | **(protected)** Critical advisory with no usable fix → exception merged with `expires` = tomorrow | Check passes, `exception_applied` row written with the alias the exception used. Next nightly scan after expiry opens an issue on main. |
-| 4 | Agent-labeled PR adds a brand-new dependency published 5 days ago | Check fails (rule 3 at 7 days *and* rule 6). Same PR from a human passes rule 3 at 3 days. |
+| 4 | Agent-labeled PR adds a brand-new dependency published 5 days ago | Check fails (rule 3 at 7 days *and* rule 6). Same PR from a human passes rule 3 at 3 days. Security approves → still fails on rule 3 only. Agent pushes another commit → rule 6 re-blocks. |
 | 5 | Repo override tries `severity: low → critical` loosening | Action fails at policy load with a clear error. |
 | 6 | Audit service stopped | Scenario 1 still blocks; event in job summary; no crash. |
 
-Unit tests cover: policy loading + tightening, alias expansion, `MAL-` refusal, release-age
-math, agent detection. Scenarios are the integration test.
+Unit tests cover: policy loading + tightening, exception matching across alias groups
+(including expiry and repo scope), `MAL-` refusal via a GHSA alias, release-age math,
+agent detection. Scenarios are the integration test.
 
 ---
 
@@ -247,13 +263,14 @@ math, agent detection. Scenarios are the integration test.
 | Day | Build | Done when |
 |---|---|---|
 | **Mon 9/14** | This spec. Create repo + demo org. | Spec committed. |
-| **Tue 9/15** | Policy loader + tightening check, exception generator + alias expansion, action running `osv-scanner` locally | Scenarios 1, 2, 5 pass locally against fixture lockfiles |
+| **Tue 9/15** | Policy loader + tightening check, action running `osv-scanner` locally, exception matcher over alias groups + `MAL-` refusal | Scenarios 1, 2, 5 pass locally against fixture lockfiles |
 | **Wed 9/16** | Demo org wiring: GitHub App, ruleset + required check, CODEOWNERS. Release age + agent rules. Nightly schedule. | Scenarios 1–5 pass in GitHub |
 | **Thu 9/17** | Audit service: OIDC verify **by hand**, Postgres schema, deploy. Seed + `EXPLAIN` **by hand**. `gh aw` agent. | Scenario 6 passes; `docs/explain.md` committed |
 | **Fri 9/18** | README with limitations, install doc, build-vs-buy doc. Oral defense via `interview-drill`. Article draft. | Tagged `v0.1.0` |
 
-**Cut order if behind** (last cut first): exception-draft PR → release-age agent comment →
-bump PR → hosted deploy (fall back to local service + tunnel for the demo recording).
+**Cut order if behind** (first cut first): exception-draft PR → scenarios 5 + 6 →
+release-age agent comment → bump PR → hosted deploy (fall back to local service + tunnel
+for the demo recording).
 **Never cut:** scenario 3, the OIDC check, the `EXPLAIN` work.
 
 **Hands-on (not delegated):** GitHub App token flow, OIDC verification, the index + `EXPLAIN`.
@@ -269,6 +286,8 @@ Everything else may be delegated to an agent, and must be defensible on Friday.
 4. Why an exception is scoped to an advisory ID, and what alias matching prevents.
 5. Why a severity threshold alone lets a compromised package through.
 6. Why a `MAL-` entry can never be waived.
+6a. Why the cooldown has no automatic waiver for fix versions, and what that costs during an urgent patch.
+6b. Why an approval only counts on the current head commit.
 7. The `EXPLAIN` plan: what changed with the index and why.
 8. Build vs. buy: what you didn't build, and what you'd tell a client who already pays for Snyk.
 9. **Limitation you measured** (for the article): e.g. how long the release-age rule would have held a real 2025 compromised version vs. when its `MAL-` entry appeared.
@@ -277,16 +296,57 @@ Everything else may be delegated to an agent, and must be defensible on Friday.
 
 ## Not this week (→ README "what's next")
 
-- Deploy-time gate before prod
+- Deploy-time gate before prod (the nightly issue raises a problem on main; nothing yet stops it shipping)
+- Agent opens a bump PR from the nightly issue, not only from failed PR checks
+- Automatic release-age waiver for the exact fixed version named in an advisory (considered, rejected for v0.1: every cooldown bypass gets a named approver)
 - Ecosystems beyond npm
 - Additional advisory sources behind an `AdvisorySource` interface (e.g. Socket) — interface stubbed, OSV only
 - MCP server as an advisory-only client of the same policy, for agents at coding time
 - Any UI
 - Multi-tenant hosted service
 
-## Open questions (resolve Tuesday morning, before code)
+## Resolved questions (researched 2026-09-14)
 
-1. **Agent PR detection:** which bot logins do current coding agents (Copilot coding agent, Claude, Codex) actually open PRs under? Verify, don't assume; the label fallback covers the gap.
-2. **Rule 6 enforcement:** reading team membership needs the App to have `members: read` on the org. Confirm the permission, or fall back to CODEOWNERS on lockfiles for agent branches.
-3. **Does `osv-scanner`'s `IgnoredVulns` already match aliases?** If yes, alias expansion is still needed for the `MAL-` refusal but not for suppression.
-4. **Scenario 2 fixture:** pick a real `MAL-` npm entry whose package has been removed from the registry, so the lockfile reference is inert.
+1. **Agent PR author logins** (GitHub search, `is:pr author:app/<slug>`):
+
+   | Agent | PR author login | App slug |
+   |---|---|---|
+   | GitHub Copilot coding agent | `Copilot` | `copilot-swe-agent` |
+   | Claude (GitHub App) | `claude[bot]` | `claude` |
+   | Devin | `devin-ai-integration[bot]` | `devin-ai-integration` |
+   | Cursor | `cursor[bot]` | `cursor` |
+   | Jules | `google-labs-jules[bot]` | `google-labs-jules` |
+   | Codex | `chatgpt-codex-connector[bot]` | `chatgpt-codex-connector` (only 3 PRs found — Codex usually pushes as the user) |
+
+   **Known limitation:** agents running locally (Claude Code, Cursor editor, Codex CLI) push
+   with the developer's own credentials, so the PR author is a human. Author detection
+   only catches cloud agents. The `agent-authored` label covers the rest by convention, not
+   enforcement. README states this plainly.
+
+2. **Rule 6 permissions** (GitHub docs, "Permissions required for GitHub Apps"; all work with installation tokens):
+   - Organization **Members: read** → `GET /orgs/{org}/teams/{team_slug}/memberships/{username}`
+   - Repository **Pull requests: read** → `GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews` (each review carries `commit_id`)
+   - Repository **Contents: read** → policy repo files
+
+   No CODEOWNERS fallback needed.
+
+3. **`osv-scanner` already matches ignores across aliases.** `pkg/osvscanner/filter.go` loops
+   over every alias in a finding's group, and one matching `IgnoredVulns` entry suppresses
+   the whole group. Exact ID match per alias; expiry via `ignoreUntil`.
+   **Consequence for the `MAL-` rule:** an exception written against a `MAL-` entry's
+   *GHSA alias* would silently suppress the malware finding. See decision below.
+
+4. **Scenario 2 fixture: `-gzip-ize`** — `MAL-2022-6`, alias `GHSA-55c4-jwq7-c38p`, affected
+   range `introduced: 0` (every version). The npm registry now serves only
+   `0.0.1-security` (npm's empty security holding package), so a lockfile entry at that
+   version is inert and still flagged. Scenario 2 also tests an exception written against
+   `GHSA-55c4-jwq7-c38p` and expects it to be refused. If the leading hyphen breaks lockfile
+   parsing, pick another entry from `ossf/malicious-packages/osv/malicious/npm`.
+
+## Decision log
+
+- **2026-09-14 — Exceptions are applied in safe-deps, not `osv-scanner`.** The scanner runs
+  with no ignores; safe-deps matches exceptions per alias group and refuses any group
+  containing a `MAL-` ID. Rejected: generating `osv-scanner.toml` plus a post-check, because
+  the gate's safety would then depend on a second check catching what the first one hid.
+  Side benefit: the audit log records raw findings before exceptions.
